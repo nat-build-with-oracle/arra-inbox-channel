@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "inbox": {
+      "command": "bun",
+      "args": ["run", "--env-file=/dev/null", "--cwd", "${CLAUDE_PLUGIN_ROOT}", "--silent", "server.ts"]
+    }
+  }
+}
