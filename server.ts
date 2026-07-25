@@ -33,7 +33,7 @@ import { basename, join } from 'node:path'
 import { homedir } from 'node:os'
 import { createHash } from 'node:crypto'
 
-const VERSION = '0.2.0'
+const VERSION = '0.3.0'
 
 const STATE_DIR = process.env.INBOX_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'inbox')
 mkdirSync(STATE_DIR, { recursive: true })
@@ -60,8 +60,25 @@ try {
   }
 } catch {}
 
+/**
+ * Every numeric knob goes through here. `Number('abc')` is NaN, and NaN propagates silently into
+ * places that fail in spectacular ways: setInterval(NaN) degenerates to a ~1ms timer (hundreds of
+ * directory scans per second), and Buffer.allocUnsafe(NaN) throws on every tick, which — before
+ * per-file isolation — killed the entire scan loop. A typo in .env should not do either.
+ */
+function num(name: string, fallback: number, min: number): number {
+  const raw = process.env[name]
+  if (raw === undefined || raw.trim() === '') return fallback
+  const v = Number(raw)
+  if (!Number.isFinite(v)) {
+    dlog(`inbox channel: ${name}=${JSON.stringify(raw)} is not a number — using ${fallback}\n`)
+    return fallback
+  }
+  return Math.max(min, Math.floor(v))
+}
+
 const INBOX_DIR = process.env.INBOX_DIR ?? join(homedir(), '.maw', 'inbox')
-const POLL_MS = Math.max(100, Number(process.env.INBOX_POLL_MS ?? '1000'))
+const POLL_MS = num('INBOX_POLL_MS', 1000, 100)
 const EXT = process.env.INBOX_EXT ?? '.jsonl'
 // Replay: 0 = start at EOF (default — a fresh attach must never dump months of backlog into
 // the session), N = emit the last N lines of each file on boot, 'all' = full backfill.
@@ -69,7 +86,7 @@ const REPLAY_RAW = (process.env.INBOX_REPLAY ?? '0').trim().toLowerCase()
 const REPLAY_ALL = REPLAY_RAW === 'all'
 const REPLAY_N = REPLAY_ALL ? Infinity : Math.max(0, Number(REPLAY_RAW) || 0)
 // Guard against a pathological single line (a runaway writer) eating memory.
-const MAX_LINE_BYTES = Number(process.env.INBOX_MAX_LINE_KB ?? '256') * 1024
+const MAX_LINE_BYTES = num('INBOX_MAX_LINE_KB', 256, 1) * 1024
 // Per-tick read ceiling: a huge append is consumed across several ticks rather than in one gulp.
 //
 // It must never be smaller than MAX_LINE_BYTES. "No newline in a full window" is the ONLY
@@ -77,10 +94,10 @@ const MAX_LINE_BYTES = Number(process.env.INBOX_MAX_LINE_KB ?? '256') * 1024
 // wide. With a window narrower than the cap that proof can never be reached, so an over-long line
 // would consume 0 bytes every tick and stall the room permanently. Clamping is safer than
 // trusting the operator to keep two independent knobs consistent.
-const RAW_MAX_READ_BYTES = Number(process.env.INBOX_MAX_READ_KB ?? '1024') * 1024
+const RAW_MAX_READ_BYTES = num('INBOX_MAX_READ_KB', 1024, 1) * 1024
 const MAX_READ_BYTES = Math.max(RAW_MAX_READ_BYTES, MAX_LINE_BYTES)
 // Burst guard: if a writer floods, don't fire thousands of notifications into the session.
-const MAX_NOTIFY_PER_TICK = Math.max(1, Number(process.env.INBOX_MAX_PER_TICK ?? '20'))
+const MAX_NOTIFY_PER_TICK = num('INBOX_MAX_PER_TICK', 20, 1)
 
 const csv = (v: string | undefined) =>
   (v ?? '').split(',').map(s => s.trim()).filter(Boolean)
@@ -96,7 +113,15 @@ const REPLY_MODE = (process.env.INBOX_REPLY_MODE ?? 'outbox').trim().toLowerCase
 const SELF = process.env.INBOX_SELF ?? '' // our own room name; used to tag outbound `from`
 
 const OUTBOX_DIR = join(STATE_DIR, 'outbox')
-const CURSOR_FILE = join(STATE_DIR, 'cursor.json')
+// The cursor file is namespaced by WHICH directory it describes. STATE_DIR defaults to one fixed
+// path, but INBOX_DIR is per-session — and cursors are keyed by bare basename. Sharing one
+// cursor.json across two different inbox directories means a `notes.jsonl` in dir A inherits the
+// offset of an unrelated `notes.jsonl` in dir B: either a chunk of history dumped into the
+// session, or messages skipped outright. The directory is part of the identity of a cursor.
+const CURSOR_FILE = join(
+  STATE_DIR,
+  `cursor-${createHash('sha256').update(INBOX_DIR).digest('hex').slice(0, 12)}.json`,
+)
 
 /**
  * A world-writable inbox dir means any local user can inject a conversation turn. Since the
@@ -239,7 +264,13 @@ function messageIdFor(room: string, line: string): string {
   return `${room}-${createHash('sha256').update(line).digest('hex').slice(0, 12)}`
 }
 
-type Parsed = { content: string; user: string; type: string; ts: string; thread: string | null }
+type Parsed = { content: string; user: string; type: string; ts: string; thread: string | null; origin?: string }
+
+// Stamped on every record we write. In peer mode our reply lands in a file we are also tailing,
+// so without a marker the channel reads its own output straight back into the session — an
+// endless self-conversation. Keyed to this process, so a DIFFERENT server still sees the message
+// normally; only the author ignores it.
+const INSTANCE = `${process.pid}-${createHash('sha256').update(`${STATE_DIR}|${process.pid}`).digest('hex').slice(0, 8)}`
 
 /**
  * A record is either a maw-shaped JSON object, some other JSON object, or a bare text line.
@@ -264,6 +295,7 @@ function parseLine(line: string): Parsed | null {
     type: String(j.type ?? 'msg'),
     ts: typeof j.ts === 'string' ? j.ts : now,
     thread: j.thread == null ? null : String(j.thread),
+    origin: typeof j.origin === 'string' ? j.origin : undefined,
   }
 }
 
@@ -293,7 +325,9 @@ function notify(room: string, line: string, p: Parsed, replayed: boolean): void 
  * A partial trailing line (writer mid-append, non-atomic write) is NOT consumed — its bytes
  * stay unread until the newline lands. This is what makes concurrent appends safe.
  */
-function readLines(path: string, from: number, to: number, skipping = false): { lines: string[]; consumed: number; skipping: boolean } {
+type Line = { text: string; bytes: number }
+
+function readLines(path: string, from: number, to: number, skipping = false, stable = true): { lines: Line[]; consumed: number; skipping: boolean } {
   const want = Math.min(to - from, MAX_READ_BYTES)
   if (want <= 0) return { lines: [], consumed: 0, skipping }
   const buf = Buffer.allocUnsafe(want)
@@ -314,33 +348,58 @@ function readLines(path: string, from: number, to: number, skipping = false): { 
   if (skipping) {
     const nl = chunk.indexOf(0x0a)
     if (nl < 0) return { lines: [], consumed: got, skipping: true } // still inside the monster line
-    const rest = chunk.subarray(nl + 1)
-    const lastNlRest = rest.lastIndexOf(0x0a)
-    if (lastNlRest < 0) return { lines: [], consumed: nl + 1, skipping: false } // line ended, no further whole lines yet
-    const text = rest.subarray(0, lastNlRest + 1).toString('utf8')
-    const lines = text.split('\n')
-    lines.pop()
-    return { lines, consumed: nl + 1 + lastNlRest + 1, skipping: false }
+    // The line ended. Hand back only the newline itself; the whole lines that follow are read on
+    // the next tick by the normal path, which keeps byte accounting in exactly one place.
+    return { lines: [], consumed: nl + 1, skipping: false }
   }
 
   const lastNl = chunk.lastIndexOf(0x0a)
   if (lastNl < 0) {
     // No newline in the whole window. Either a writer is mid-line, or one line exceeds our
     // ceiling. Only the latter needs intervention — otherwise we would stall forever.
-    if (got >= MAX_LINE_BYTES) {
+    // `stable` means the file did not grow since the previous tick. Without that check a writer
+    // legitimately streaming a large record gets its data discarded mid-flight: the reader sees
+    // a full window with no newline yet and declares the line over-long, when in truth the
+    // newline simply had not been written. A big record and a slow writer look identical in a
+    // single sample; only time distinguishes them.
+    if (got >= MAX_LINE_BYTES && stable) {
       dlog(`inbox channel: line > ${MAX_LINE_BYTES}B in ${basename(path)} — skipping to end of line\n`)
       return { lines: [], consumed: got, skipping: true }
     }
     return { lines: [], consumed: 0, skipping: false }
   }
-  // Cutting at a newline guarantees the slice is whole UTF-8 — a multibyte character can never
-  // straddle the boundary, so no replacement chars from a mid-rune split.
-  const text = chunk.subarray(0, lastNl + 1).toString('utf8')
-  // Keep empty lines in the array: byte accounting in scanFile depends on the array being a
-  // faithful 1:1 image of the consumed bytes. They are skipped at emit time instead.
-  const lines = text.split('\n')
-  lines.pop() // trailing '' after the final newline — not a record
+  // Split in the BYTE domain and record each line's true byte length.
+  //
+  // Decoding first and measuring the string with Buffer.byteLength would be a latent corruption
+  // bug: toString('utf8') maps every invalid byte to U+FFFD, which re-encodes to THREE bytes, so
+  // one stray 0x80 on the wire inflates the count by two. That inflated count feeds the cursor on
+  // a capped tick, and an offset past EOF trips the rotation check — which resets to 0 and
+  // re-delivers the whole file, forever. Cutting at a newline prevents a mid-rune split; it does
+  // not make the bytes valid UTF-8. Only the raw buffer knows how long a line really is.
+  const lines: Line[] = []
+  let start = 0
+  while (start <= lastNl) {
+    const nl = chunk.indexOf(0x0a, start)
+    if (nl < 0 || nl > lastNl) break
+    lines.push({ text: chunk.subarray(start, nl).toString('utf8'), bytes: nl - start + 1 })
+    start = nl + 1
+  }
   return { lines, consumed: lastNl + 1, skipping: false }
+}
+
+/** Read the single byte before `offset` and report whether it is the newline we stopped at. */
+function endsWithNewlineAt(path: string, offset: number): boolean {
+  let fd: number | undefined
+  try {
+    fd = openSync(path, 'r')
+    const b = Buffer.allocUnsafe(1)
+    const got = readSync(fd, b, 0, 1, offset - 1)
+    return got === 1 && b[0] === 0x0a
+  } catch {
+    return true // unreadable for now — let the normal path handle and log it
+  } finally {
+    if (fd !== undefined) try { closeSync(fd) } catch {}
+  }
 }
 
 function listInboxFiles(): string[] {
@@ -355,8 +414,10 @@ function listInboxFiles(): string[] {
 }
 
 let booted = false
-// Log a refused symlink once per file, not once per poll tick (1/s forever otherwise).
+let replaying = false
+// Log a refused symlink / failing file once per cause, not once per poll tick (1/s forever).
 const warnedSymlink = new Set<string>()
+const warnedScan = new Set<string>()
 
 function scanFile(file: string): number {
   const path = join(INBOX_DIR, file)
@@ -392,13 +453,18 @@ function scanFile(file: string): number {
     if (!booted && REPLAY_N > 0) {
       if (REPLAY_ALL) start = 0
       else {
-        // Walk back from EOF to find the start of the last N lines, without reading the
-        // whole file: scan a bounded tail window.
-        const window = Math.min(st.size, MAX_READ_BYTES)
-        const { lines } = readLines(path, st.size - window, st.size)
+        // Walk back to the start of the last N lines without reading the whole file: scan a
+        // bounded tail window.
+        const from = Math.max(0, st.size - MAX_READ_BYTES)
+        const { lines, consumed } = readLines(path, from, st.size)
+        // Anchor on the last COMPLETE line, not on st.size. readLines deliberately stops at the
+        // final newline, so a file with a trailing partial line (a writer mid-append) makes
+        // st.size overshoot the end of whole lines — and the cursor would land inside a record,
+        // delivering its tail as a bogus first message.
+        const endOfWholeLines = from + consumed
         const tail = lines.slice(-REPLAY_N)
-        const bytes = tail.reduce((n, l) => n + Buffer.byteLength(l) + 1, 0)
-        start = Math.max(0, st.size - bytes)
+        const bytes = tail.reduce((n, l) => n + l.bytes, 0)
+        start = Math.max(0, endOfWholeLines - bytes)
       }
     }
     cur = { offset: start, size: st.size, ino: st.ino }
@@ -408,18 +474,31 @@ function scanFile(file: string): number {
 
   // Rotation / truncation: the file shrank, or the inode changed under a same-named path.
   // Either way our offset is meaningless — restart from the beginning of the new file.
-  if (st.size < cur.offset || (cur.ino && st.ino && st.ino !== cur.ino)) {
-    dlog(`inbox channel: ${file} rotated/truncated (size ${cur.offset}→${st.size}, ino ${cur.ino}→${st.ino}) — resetting cursor\n`)
+  let rotated = st.size < cur.offset || (cur.ino !== 0 && st.ino !== 0 && st.ino !== cur.ino)
+
+  // Same-inode rewrite: `>file` then writing MORE than before leaves size >= offset and the inode
+  // unchanged, so neither check above fires and we would resume reading from the middle of new
+  // content — emitting a fragment. The byte just before our offset must be the newline we stopped
+  // at; if it is not, the bytes underneath us were replaced. Only checked when the file changed,
+  // so the steady state costs nothing.
+  if (!rotated && cur.offset > 0 && st.size !== cur.size && !endsWithNewlineAt(path, cur.offset)) {
+    dlog(`inbox channel: ${file} rewritten in place (byte at ${cur.offset - 1} is not a newline) — resetting cursor\n`)
+    rotated = true
+  }
+
+  if (rotated) {
+    dlog(`inbox channel: ${file} rotated/truncated (offset ${cur.offset}, size ${st.size}, ino ${cur.ino}→${st.ino}) — resetting cursor\n`)
     cur.offset = 0
     cur.ino = st.ino
+    cur.skipping = false
     cursorDirty = true
   }
 
   if (st.size <= cur.offset) { cur.size = st.size; return 0 }
 
-  const { lines, consumed, skipping } = readLines(path, cur.offset, st.size, cur.skipping)
+  const { lines, consumed, skipping } = readLines(path, cur.offset, st.size, cur.skipping, st.size === cur.size)
   cur.skipping = skipping
-  if (!consumed) return 0
+  if (!consumed) { cur.size = st.size; cursorDirty = true; return 0 }
 
   // The cursor advances only over lines we actually HANDLED. Advancing over the whole read
   // window up front would mean the burst cap silently ate mail: the un-notified remainder
@@ -430,14 +509,15 @@ function scanFile(file: string): number {
   let capped = false
   for (const line of lines) {
     if (sent >= MAX_NOTIFY_PER_TICK) { capped = true; break }
-    bytesHandled += Buffer.byteLength(line, 'utf8') + 1 // +1 for the '\n' we split on
-    const record = line.endsWith('\r') ? line.slice(0, -1) : line // tolerate CRLF writers
+    bytesHandled += line.bytes // exact, measured on the raw buffer — never re-encoded
+    const record = line.text.endsWith('\r') ? line.text.slice(0, -1) : line.text // tolerate CRLF
     if (!record) continue // blank separator line — consumed, but not a message
     const p = parseLine(record)
     if (!p) continue
+    if (p.origin && p.origin === INSTANCE) continue // our own peer-mode reply, echoed back
     if (IGNORE_TYPES.has(p.type)) continue
     if (IGNORE_FROM.has(p.user)) continue
-    notify(room, record, p, !booted && REPLAY_N > 0)
+    notify(room, record, p, replaying)
     sent++
   }
 
@@ -454,10 +534,27 @@ function scanFile(file: string): number {
 }
 
 function scanAll(): void {
+  let files: string[] = []
   try {
-    for (const f of listInboxFiles()) scanFile(f)
+    files = listInboxFiles()
   } catch (err) {
-    dlog(`inbox channel: scan error: ${err instanceof Error ? err.message : err}\n`)
+    dlog(`inbox channel: cannot list ${INBOX_DIR}: ${err instanceof Error ? err.message : err}\n`)
+    return
+  }
+  for (const f of files) {
+    // Per-FILE isolation, not per-tick. listInboxFiles() returns sorted names, so a single
+    // unreadable file (a chmod 000 drop from another user — routine in a shared federation
+    // inbox) would otherwise throw out of the loop and starve every alphabetically-later room
+    // for as long as it sits there. Silently, and forever.
+    try {
+      scanFile(f)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      if (!warnedScan.has(f + msg)) {
+        warnedScan.add(f + msg)
+        dlog(`inbox channel: ${f} skipped this tick: ${msg}\n`)
+      }
+    }
   }
   saveCursors()
 }
@@ -516,6 +613,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         msg: String(a.text ?? ''),
         thread: null,
         id,
+        origin: INSTANCE, // so we don't re-ingest our own reply in peer mode
         ...(a.reply_to ? { replyTo: String(a.reply_to) } : {}),
       }
       appendJsonl(join(OUTBOX_DIR, `${room}${EXT}`), rec)
@@ -536,6 +634,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         msg: String(a.text ?? ''),
         thread: null,
         id: String(a.message_id ?? ''),
+        origin: INSTANCE,
       }
       appendJsonl(join(OUTBOX_DIR, `${room}${EXT}`), rec)
       deliverToPeer(room, rec)
@@ -551,6 +650,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   }
 })
 
+// The boot scan (and any replay) must not run until the client has finished initializing.
+// Notifications emitted before `notifications/initialized` are discarded by the peer, so the
+// very first messages — including the entire replay window someone explicitly asked for — would
+// vanish into the void with no error anywhere. Waiting costs one round trip.
+let startScanning: () => void
+const initialized = new Promise<void>(resolve => { startScanning = () => resolve() })
+mcp.oninitialized = () => startScanning()
+
 await mcp.connect(new StdioServerTransport())
 
 dlog(
@@ -564,9 +671,14 @@ if (MAX_READ_BYTES !== RAW_MAX_READ_BYTES) {
   )
 }
 
+// A client that connects but never initializes must not wedge the channel forever.
+await Promise.race([initialized, new Promise<void>(r => setTimeout(r, 10_000).unref?.())])
+
 // Boot scan establishes cursors (and emits the replay window, if any).
+replaying = REPLAY_N > 0
 scanAll()
 booted = true
+replaying = false
 
 // Poll is the reliable floor: it survives editors that write-and-rename, network filesystems,
 // and platforms where fs.watch drops events. The watcher below is only an accelerator.

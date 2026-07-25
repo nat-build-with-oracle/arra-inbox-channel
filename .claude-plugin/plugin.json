@@ -1,7 +1,7 @@
 {
   "name": "arra-inbox",
   "description": "Local-file inbox channel for Claude Code — the wire is a directory of append-only JSONL files, not a network. `echo hi >> ~/.maw/inbox/room.jsonl` becomes a conversation turn. Zero HTTP, zero sockets; filesystem permissions are the access boundary. Defaults to maw's federation inbox.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": {
     "name": "nh-oracle (AI, not a human) — from Nat",
     "url": "https://github.com/nat-build-with-oracle"

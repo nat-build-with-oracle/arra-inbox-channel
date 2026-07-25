@@ -115,6 +115,27 @@ or skips. Truncation and inode changes are detected and reset the offset.
 filesystems, editors that write-and-rename, and some platforms. It is used to make delivery feel
 instant; a 1s poll guarantees delivery even where it fails entirely.
 
+**Byte accounting never touches decoded text.** Line lengths are measured on the raw buffer.
+Decoding first and measuring the string would be a slow-acting corruption bug: `toString('utf8')`
+maps every invalid byte to `U+FFFD`, which re-encodes to *three* bytes, so a single stray `0x80`
+inflates the count by two — and an offset pushed past EOF trips the rotation check, which resets
+to zero and re-delivers the whole file, forever. Cutting at a newline prevents a mid-rune split;
+it does not make the bytes valid UTF-8.
+
+**One bad file cannot starve the others.** Scanning is isolated per file, not per tick. In a
+shared federation inbox a `chmod 000` file from another user is routine, and a single try/catch
+around the whole loop would let it silently starve every alphabetically-later room for as long as
+it sat there.
+
+**A rewrite in place is detected too.** `>file` followed by *more* content than before leaves the
+size above our offset and the inode unchanged, so neither the shrink nor the inode check fires.
+The byte before the cursor must be the newline we stopped at; when it isn't, the file was
+replaced underneath us and the cursor resets.
+
+**A slow writer is not mistaken for an over-long line.** In a single sample, "a 300KB record still
+being written" and "a line past the cap" look identical. The skip only fires once the file has
+stopped growing.
+
 ## Access control
 
 **Filesystem permissions are the entire boundary** — the same delegation `arra-mqtt` makes to
@@ -124,6 +145,16 @@ the session.
 The server therefore **refuses to boot** if `INBOX_DIR` is world-writable, and `reply`'s
 model-supplied `chat_id` is validated against `[A-Za-z0-9._-]` with no leading dot before it is
 ever joined into a path.
+
+**Symlinked rooms are refused in both directions.** `appendFileSync` follows symlinks, so
+`evil.jsonl -> ~/.ssh/authorized_keys` would turn a reply into an append to `authorized_keys`; the
+read side is worse, since a room symlinked at `~/.ssh/id_rsa` would stream a private key into the
+conversation line by line. `lstat` — which does not follow — refuses both.
+
+**Anyone who can write to the wire can claim any identity.** `meta.user` comes from the record's
+`from` field, so a writer can put any name on a message. That is inherent to the transport, not a
+gap in it: write access to `INBOX_DIR` is full trust, exactly as broker credentials are for
+`arra-mqtt`. Treat `meta.user` as a label, never as authentication.
 
 Keep `INBOX_DIR` local, private, and not synced from anywhere you don't control.
 
@@ -170,13 +201,18 @@ Anything that can append to a file is now a Claude Code client. That is the whol
 
 ```bash
 bun install
-bun --env-file=/dev/null run test-e2e.ts   # 58 e2e assertions, real stdio, real files
+bun --env-file=/dev/null run test-e2e.ts   # 92 e2e assertions, real stdio, real files
 ```
 
 The suite drives the actual server over real JSON-RPC stdio against real temp directories —
 nothing is mocked. It asserts the "no network" promise structurally (no net imports, no `fetch`,
-no `WebSocket`), and covers partial lines, rotation, restart resume, burst deferral, CRLF, unicode,
-path traversal, and the world-writable refusal.
+no `WebSocket`), and covers partial lines, rotation, in-place rewrite, restart resume, burst
+deferral, CRLF, unicode, invalid UTF-8, over-long lines, unreadable files, path traversal,
+symlink refusal, self-echo, garbage config, cursor namespacing, and the world-writable refusal.
+
+Most of those cases exist because a 5-lens adversarial audit found them in an earlier version and
+proved each one against the running server. The findings, and the reasoning that killed the false
+ones, are worth reading before changing the tailing logic.
 
 > `--env-file=/dev/null` matters: bun autoloads `cwd/.env` before the server runs, which would be
 > indistinguishable from real environment. The flag must be on the **innermost** bun, because

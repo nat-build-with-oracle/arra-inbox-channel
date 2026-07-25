@@ -5,7 +5,7 @@
  *   bun --env-file=/dev/null run test-e2e.ts
  */
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { appendFileSync, mkdtempSync, mkdirSync, readFileSync, existsSync, writeFileSync, statSync, rmSync } from 'node:fs'
+import { appendFileSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, existsSync, writeFileSync, statSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
@@ -109,6 +109,12 @@ function tmp(): { dir: string; state: string; root: string } {
 }
 
 const cleanup: string[] = []
+
+/** The cursor file is namespaced by the watched directory, so tests resolve it the same way. */
+function cursorPath(state: string): string {
+  const f = readdirSync(state).find(n => n.startsWith('cursor-') && n.endsWith('.json'))
+  return f ? join(state, f) : join(state, 'cursor-missing.json')
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 console.log('\n1. handshake + capability + tools')
@@ -220,7 +226,7 @@ console.log('\n6. cursor persistence: restart resumes, does not re-deliver')
   await sleep(500)
   h1.kill()
 
-  check('cursor.json written', existsSync(join(state, 'cursor.json')))
+  check('cursor file written', existsSync(cursorPath(state)))
 
   const h2 = new Harness(dir, state)
   await h2.initialize()
@@ -516,7 +522,7 @@ console.log('\n20. two servers sharing a STATE_DIR do not rewind each other')
   await sleep(700)
   a.kill(); b.kill()
 
-  const saved = JSON.parse(readFileSync(join(state, 'cursor.json'), 'utf8'))
+  const saved = JSON.parse(readFileSync(cursorPath(state), 'utf8'))
   const size = statSync(f).size
   check('merged cursor is at EOF, not rewound', saved['shared.jsonl']?.offset === size,
     `offset=${saved['shared.jsonl']?.offset} size=${size}`)
@@ -527,6 +533,181 @@ console.log('\n20. two servers sharing a STATE_DIR do not rewind each other')
   await sleep(800)
   check('a later server replays nothing', c.channelMsgs().length === 0, `got ${c.channelMsgs().length}`)
   c.kill()
+}
+
+console.log('\n21. invalid UTF-8 + burst cap does not desync the cursor')
+{
+  const { dir, state, root } = tmp(); cleanup.push(root)
+  const h = new Harness(dir, state, { INBOX_MAX_PER_TICK: '3' })
+  await h.initialize()
+  await sleep(400)
+  const f = join(dir, 'bad.jsonl')
+  // 3 clean records, one carrying raw 0x80 bytes (invalid UTF-8), then 4 more. With a cap of 3
+  // the capped tick advances by measured bytes — if those were counted on the DECODED string,
+  // each 0x80 would inflate the count by 2 and push the offset past EOF, tripping the rotation
+  // check and re-delivering the file forever.
+  for (let i = 0; i < 3; i++) appendFileSync(f, JSON.stringify({ from: 'a', type: 'msg', msg: `clean ${i}` }) + '\n')
+  appendFileSync(f, Buffer.concat([
+    Buffer.from('{"from":"a","type":"msg","msg":"bad '),
+    Buffer.from([0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+                 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80]),
+    Buffer.from('"}\n'),
+  ]))
+  for (let i = 0; i < 4; i++) appendFileSync(f, JSON.stringify({ from: 'a', type: 'msg', msg: `after ${i}` }) + '\n')
+
+  await sleep(4000)
+  const contents = h.channelMsgs().map(m => String(m.params.content))
+  const size = statSync(f).size
+  const saved = JSON.parse(readFileSync(cursorPath(state), 'utf8'))['bad.jsonl']
+
+  check('cursor did not overshoot EOF', (saved?.offset ?? 0) <= size, `offset=${saved?.offset} size=${size}`)
+  check('no duplicate-delivery storm', contents.length === 8, `got ${contents.length}`)
+  check('no rotation reset was triggered', !h.stderr.includes('resetting cursor'),
+    h.stderr.split('\n').filter(l => l.includes('reset')).slice(0, 2).join(' | '))
+  check('every clean record arrived exactly once',
+    ['clean 0', 'clean 1', 'clean 2', 'after 0', 'after 1', 'after 2', 'after 3']
+      .every(m => contents.filter(c => c === m).length === 1),
+    contents.join(' | ').slice(0, 200))
+  h.kill()
+}
+
+console.log('\n22. one unreadable file does not starve alphabetically-later rooms')
+{
+  const { dir, state, root } = tmp(); cleanup.push(root)
+  const { chmodSync } = await import('node:fs')
+  const h = new Harness(dir, state)
+  await h.initialize()
+  await sleep(400)
+
+  const locked = join(dir, 'aaa-locked.jsonl')
+  writeFileSync(locked, '')
+  appendFileSync(locked, JSON.stringify({ from: 'x', type: 'msg', msg: 'unreachable' }) + '\n')
+  chmodSync(locked, 0o000)
+
+  appendFileSync(join(dir, 'zzz-good.jsonl'), JSON.stringify({ from: 'x', type: 'msg', msg: 'must still arrive' }) + '\n')
+  const msgs = await h.waitForChannel(1, 6000)
+  check('later room still delivers despite the locked file', msgs.length === 1,
+    `got ${msgs.length}; stderr=${h.stderr.slice(-200)}`)
+  check('it is the right message', msgs[0]?.params?.content === 'must still arrive')
+  chmodSync(locked, 0o600) // let cleanup remove it
+  h.kill()
+}
+
+console.log('\n23. same-inode rewrite is detected (no mid-content fragment)')
+{
+  const { dir, state, root } = tmp(); cleanup.push(root)
+  const h = new Harness(dir, state)
+  await h.initialize()
+  await sleep(400)
+  const f = join(dir, 'rewrite.jsonl')
+  appendFileSync(f, JSON.stringify({ from: 'a', type: 'msg', msg: 'short' }) + '\n')
+  await h.waitForChannel(1)
+  // Rewrite in place with LONGER content: size stays >= offset and the inode is unchanged, so
+  // neither the shrink nor the inode check fires.
+  writeFileSync(f,
+    JSON.stringify({ from: 'a', type: 'msg', msg: 'brand new line one that is much longer' }) + '\n' +
+    JSON.stringify({ from: 'a', type: 'msg', msg: 'brand new line two that is much longer' }) + '\n')
+  const msgs = await h.waitForChannel(3, 6000)
+  const got = msgs.map(m => String(m.params.content))
+  check('both rewritten lines delivered whole', got.includes('brand new line one that is much longer') &&
+    got.includes('brand new line two that is much longer'), got.join(' | ').slice(0, 180))
+  check('no fragment was emitted', !got.some(c => c.startsWith('from"') || c.includes('","type"')),
+    got.join(' | ').slice(0, 180))
+  h.kill()
+}
+
+console.log('\n24. peer-mode reply does not echo back into our own session')
+{
+  const { dir, state, root } = tmp(); cleanup.push(root)
+  // The room we reply INTO is one we also tail — the self-feedback setup.
+  const h = new Harness(dir, state, { INBOX_REPLY_MODE: 'peer', INBOX_SELF: 'me' })
+  await h.initialize()
+  await sleep(400)
+  const before = h.channelMsgs().length
+  const r = await h.request('tools/call', { name: 'reply', arguments: { chat_id: 'loop', text: 'my own words' } })
+  check('peer reply succeeded', !r.result?.isError, JSON.stringify(r.result).slice(0, 150))
+  await sleep(2500)
+  const mine = h.channelMsgs().slice(before).filter(m => String(m.params.content) === 'my own words')
+  check('our own reply is not re-ingested', mine.length === 0, `echoed ${mine.length}×`)
+
+  // …but a message from someone ELSE in that same room still arrives.
+  appendFileSync(join(dir, 'loop.jsonl'), JSON.stringify({ from: 'peer', type: 'msg', msg: 'their words' }) + '\n')
+  const msgs = await h.waitForChannel(before + 1, 5000)
+  check('a real peer message in the same room still arrives',
+    msgs.some(m => String(m.params.content) === 'their words'),
+    msgs.map(m => m.params.content).join(' | ').slice(0, 150))
+  h.kill()
+}
+
+console.log('\n25. garbage numeric env vars degrade safely')
+{
+  const { dir, state, root } = tmp(); cleanup.push(root)
+  const h = new Harness(dir, state, {
+    INBOX_POLL_MS: 'abc', INBOX_MAX_READ_KB: 'not-a-number', INBOX_MAX_PER_TICK: '',
+  })
+  await h.initialize()
+  await sleep(600)
+  check('server survived NaN config', h.proc.exitCode === null, `exitCode=${h.proc.exitCode}`)
+  appendFileSync(join(dir, 'nan.jsonl'), JSON.stringify({ from: 'a', type: 'msg', msg: 'still delivers' }) + '\n')
+  const msgs = await h.waitForChannel(1, 6000)
+  check('delivery still works on defaults', msgs.length === 1 && msgs[0].params.content === 'still delivers',
+    `got ${msgs.length}; stderr=${h.stderr.slice(-200)}`)
+  check('the bad value was reported', h.stderr.includes('is not a number'), h.stderr.slice(-200))
+  h.kill()
+}
+
+console.log('\n26. replay is not lost to a slow initialize, and lands on line boundaries')
+{
+  const { dir, state, root } = tmp(); cleanup.push(root)
+  const f = join(dir, 'slow.jsonl')
+  for (let i = 0; i < 5; i++) appendFileSync(f, JSON.stringify({ from: 'a', type: 'msg', msg: `hist ${i}` }) + '\n')
+  appendFileSync(f, '{"from":"a","type":"msg","msg":"partial and unterminated') // no newline
+
+  const h = new Harness(dir, state, { INBOX_REPLAY: '2' })
+  await sleep(1500) // deliberately slow client: connect, then wait before initializing
+  await h.initialize()
+  const msgs = await h.waitForChannel(2, 6000)
+  check('replay survived the slow initialize', msgs.length === 2, `got ${msgs.length}`)
+  check('replayed the last 2 WHOLE lines', msgs.map(m => m.params.content).join(',') === 'hist 3,hist 4',
+    msgs.map(m => m.params.content).join(','))
+  check('no fragment of the partial line', !msgs.some(m => String(m.params.content).includes('unterminated')))
+  h.kill()
+}
+
+console.log('\n27. two different INBOX_DIRs sharing a STATE_DIR do not collide on basenames')
+{
+  const { state, root } = tmp(); cleanup.push(root)
+  const dirA = join(root, 'inboxA'); mkdirSync(dirA, { recursive: true, mode: 0o700 })
+  const dirB = join(root, 'inboxB'); mkdirSync(dirB, { recursive: true, mode: 0o700 })
+
+  // Same basename in both directories, different content. A shared cursor keyed by bare
+  // basename would hand B's fresh file the offset A had already reached.
+  for (let i = 0; i < 30; i++) {
+    appendFileSync(join(dirA, 'notes.jsonl'), JSON.stringify({ from: 'a', type: 'msg', msg: `A${i}` }) + '\n')
+  }
+  const a = new Harness(dirA, state)
+  await a.initialize()
+  await sleep(500)
+  appendFileSync(join(dirA, 'notes.jsonl'), JSON.stringify({ from: 'a', type: 'msg', msg: 'A-new' }) + '\n')
+  await a.waitForChannel(1)
+  a.proc.stdin.end(); await sleep(400); a.kill()
+
+  // B's notes.jsonl is brand new and SHORT — if it inherited A's large offset it would be
+  // treated as truncated (replaying everything) or skipped entirely.
+  appendFileSync(join(dirB, 'notes.jsonl'), JSON.stringify({ from: 'b', type: 'msg', msg: 'B-only' }) + '\n')
+  const b = new Harness(dirB, state)
+  await b.initialize()
+  await sleep(900)
+  check('B does not inherit A\'s offset (no spurious replay)', b.channelMsgs().length === 0,
+    b.channelMsgs().map(m => m.params.content).join(','))
+  appendFileSync(join(dirB, 'notes.jsonl'), JSON.stringify({ from: 'b', type: 'msg', msg: 'B-new' }) + '\n')
+  const msgs = await b.waitForChannel(1, 5000)
+  check('B still delivers its own new mail', msgs.length === 1 && msgs[0].params.content === 'B-new',
+    `got ${msgs.length}`)
+  check('two separate cursor files exist',
+    readdirSync(state).filter(n => n.startsWith('cursor-')).length === 2,
+    readdirSync(state).join(','))
+  b.kill()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
