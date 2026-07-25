@@ -5,7 +5,7 @@
  *   bun --env-file=/dev/null run test-e2e.ts
  */
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { appendFileSync, mkdtempSync, mkdirSync, readFileSync, existsSync, writeFileSync, rmSync } from 'node:fs'
+import { appendFileSync, mkdtempSync, mkdirSync, readFileSync, existsSync, writeFileSync, statSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
@@ -427,6 +427,106 @@ console.log('\n17. unicode is never split mid-rune')
     JSON.stringify(msgs[0]?.params?.content))
   check('no replacement characters', !String(msgs[0]?.params?.content ?? '').includes('�'))
   h.kill()
+}
+
+console.log('\n18. symlinked rooms are refused in BOTH directions')
+{
+  const { dir, state, root } = tmp(); cleanup.push(root)
+  const { symlinkSync } = await import('node:fs')
+
+  // A "secret" outside the inbox, as if it were ~/.ssh/id_rsa.
+  const secret = join(root, 'secret.txt')
+  writeFileSync(secret, 'PRIVATE KEY MATERIAL\nsecond secret line\n')
+  // …and a victim file a peer-mode write must never be redirected into.
+  const victim = join(root, 'authorized_keys')
+  writeFileSync(victim, 'ssh-rsa LEGITIMATE\n')
+
+  symlinkSync(secret, join(dir, 'leak.jsonl'))   // read side
+  symlinkSync(victim, join(dir, 'pwn.jsonl'))    // write side
+
+  const h = new Harness(dir, state, { INBOX_REPLY_MODE: 'peer' })
+  await h.initialize()
+  await sleep(1200)
+
+  const leaked = h.channelMsgs().map(m => String(m.params.content)).join('\n')
+  check('symlinked room is NOT read into the session', h.channelMsgs().length === 0,
+    `leaked: ${leaked.slice(0, 120)}`)
+  check('no secret material reached the channel', !leaked.includes('PRIVATE KEY MATERIAL'))
+  check('refusal is logged', h.stderr.includes('symlink'), h.stderr.slice(-200))
+
+  const r = await h.request('tools/call', { name: 'reply', arguments: { chat_id: 'pwn', text: 'ssh-rsa ATTACKER' } })
+  check('peer write through a symlink is refused', r.result?.isError === true,
+    JSON.stringify(r.result).slice(0, 200))
+  check('victim file was NOT appended to',
+    readFileSync(victim, 'utf8') === 'ssh-rsa LEGITIMATE\n', JSON.stringify(readFileSync(victim, 'utf8')))
+
+  // A normal room in the same directory still works — the guard is targeted, not a blanket ban.
+  appendFileSync(join(dir, 'normal.jsonl'), JSON.stringify({ from: 'a', type: 'msg', msg: 'still fine' }) + '\n')
+  const msgs = await h.waitForChannel(1)
+  check('non-symlink rooms are unaffected', msgs.length === 1 && msgs[0].params.content === 'still fine',
+    `got ${msgs.length}`)
+  h.kill()
+}
+
+console.log('\n19. an over-long line is skipped WHOLE, not fragmented into the session')
+{
+  const { dir, state, root } = tmp(); cleanup.push(root)
+  // 8KB cap, 4KB read window: the monster line is far bigger than both, so the skip must span
+  // several ticks and still land exactly on the line's end.
+  const h = new Harness(dir, state, { INBOX_MAX_LINE_KB: '8', INBOX_MAX_READ_KB: '4' })
+  await h.initialize()
+  await sleep(400)
+  const f = join(dir, 'huge.jsonl')
+  appendFileSync(f, JSON.stringify({ from: 'a', type: 'msg', msg: 'X'.repeat(200_000) }) + '\n')
+  appendFileSync(f, JSON.stringify({ from: 'a', type: 'msg', msg: 'after the monster' }) + '\n')
+  const msgs = await h.waitForChannel(1, 12000)
+  check('exactly one message survives', msgs.length === 1, `got ${msgs.length}: ` +
+    msgs.map(m => String(m.params.content).slice(0, 30)).join(' | '))
+  check('it is the line AFTER the monster', msgs[0]?.params?.content === 'after the monster',
+    String(msgs[0]?.params?.content).slice(0, 60))
+  check('no fragment of the monster leaked', !msgs.some(m => String(m.params.content).includes('XXXX')))
+  check('narrow read window was clamped, not left to stall', h.stderr.includes('raised to match'),
+    h.stderr.slice(-200))
+  h.kill()
+}
+
+console.log('\n20. two servers sharing a STATE_DIR do not rewind each other')
+{
+  const { dir, state, root } = tmp(); cleanup.push(root)
+  const f = join(dir, 'shared.jsonl')
+
+  // A reads 3 lines and saves. B starts later, sees only 1 more line, and saves too.
+  const a = new Harness(dir, state)
+  await a.initialize()
+  await sleep(400)
+  for (let i = 0; i < 3; i++) appendFileSync(f, JSON.stringify({ from: 'x', type: 'msg', msg: `m${i}` }) + '\n')
+  await a.waitForChannel(3)
+  check('server A saw all 3', a.channelMsgs().length === 3, `got ${a.channelMsgs().length}`)
+
+  const b = new Harness(dir, state)
+  await b.initialize()
+  await sleep(600)
+  appendFileSync(f, JSON.stringify({ from: 'x', type: 'msg', msg: 'm3' }) + '\n')
+  await b.waitForChannel(1)
+  await a.waitForChannel(4)
+  check('both servers received the new line', a.channelMsgs().length === 4 && b.channelMsgs().length === 1,
+    `A=${a.channelMsgs().length} B=${b.channelMsgs().length}`)
+
+  a.proc.stdin.end(); b.proc.stdin.end()
+  await sleep(700)
+  a.kill(); b.kill()
+
+  const saved = JSON.parse(readFileSync(join(state, 'cursor.json'), 'utf8'))
+  const size = statSync(f).size
+  check('merged cursor is at EOF, not rewound', saved['shared.jsonl']?.offset === size,
+    `offset=${saved['shared.jsonl']?.offset} size=${size}`)
+
+  // The real consequence: a THIRD server must not re-deliver anything.
+  const c = new Harness(dir, state)
+  await c.initialize()
+  await sleep(800)
+  check('a later server replays nothing', c.channelMsgs().length === 0, `got ${c.channelMsgs().length}`)
+  c.kill()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

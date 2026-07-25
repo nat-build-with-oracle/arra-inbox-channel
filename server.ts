@@ -26,14 +26,14 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import {
-  appendFileSync, chmodSync, closeSync, mkdirSync, openSync, readFileSync,
-  readSync, readdirSync, realpathSync, renameSync, statSync, watch, writeFileSync,
+  appendFileSync, chmodSync, closeSync, lstatSync, mkdirSync, openSync, readFileSync,
+  readSync, readdirSync, renameSync, statSync, watch, writeFileSync,
 } from 'node:fs'
-import { basename, join, sep } from 'node:path'
+import { basename, join } from 'node:path'
 import { homedir } from 'node:os'
 import { createHash } from 'node:crypto'
 
-const VERSION = '0.1.0'
+const VERSION = '0.2.0'
 
 const STATE_DIR = process.env.INBOX_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'inbox')
 mkdirSync(STATE_DIR, { recursive: true })
@@ -71,7 +71,14 @@ const REPLAY_N = REPLAY_ALL ? Infinity : Math.max(0, Number(REPLAY_RAW) || 0)
 // Guard against a pathological single line (a runaway writer) eating memory.
 const MAX_LINE_BYTES = Number(process.env.INBOX_MAX_LINE_KB ?? '256') * 1024
 // Per-tick read ceiling: a huge append is consumed across several ticks rather than in one gulp.
-const MAX_READ_BYTES = Number(process.env.INBOX_MAX_READ_KB ?? '1024') * 1024
+//
+// It must never be smaller than MAX_LINE_BYTES. "No newline in a full window" is the ONLY
+// evidence we have that a line is over-long, and it only proves the line is at least one window
+// wide. With a window narrower than the cap that proof can never be reached, so an over-long line
+// would consume 0 bytes every tick and stall the room permanently. Clamping is safer than
+// trusting the operator to keep two independent knobs consistent.
+const RAW_MAX_READ_BYTES = Number(process.env.INBOX_MAX_READ_KB ?? '1024') * 1024
+const MAX_READ_BYTES = Math.max(RAW_MAX_READ_BYTES, MAX_LINE_BYTES)
 // Burst guard: if a writer floods, don't fire thousands of notifications into the session.
 const MAX_NOTIFY_PER_TICK = Math.max(1, Number(process.env.INBOX_MAX_PER_TICK ?? '20'))
 
@@ -121,7 +128,7 @@ function assertInboxDirSane(): void {
 assertInboxDirSane()
 
 // --- cursor: byte offset per file, so a restart resumes exactly where it stopped ---
-type Cursor = { offset: number; size: number; ino: number }
+type Cursor = { offset: number; size: number; ino: number; skipping?: boolean }
 let cursors: Record<string, Cursor> = {}
 try { cursors = JSON.parse(readFileSync(CURSOR_FILE, 'utf8')) } catch {}
 
@@ -129,10 +136,24 @@ let cursorDirty = false
 function saveCursors(): void {
   if (!cursorDirty) return
   // atomic: write a temp file in the same dir, then rename. A crash mid-write can never
-  // leave a truncated cursor.json that would silently replay or skip messages.
+  // leave a truncated cursor.json that would silently replay or skip messages. The temp name
+  // carries our pid so two servers never collide on the same partial file.
   const tmp = `${CURSOR_FILE}.${process.pid}.tmp`
   try {
-    writeFileSync(tmp, JSON.stringify(cursors, null, 2))
+    // Two Claude sessions can run this plugin against the same STATE_DIR. Each keeps its own
+    // in-memory position (so each session gets every message), but the file is shared — a blind
+    // overwrite would let the slower writer rewind the saved position and re-deliver old mail
+    // into the NEXT session. Merge by furthest-read instead: last-writer-wins is the bug.
+    let onDisk: Record<string, Cursor> = {}
+    try { onDisk = JSON.parse(readFileSync(CURSOR_FILE, 'utf8')) } catch {}
+    const merged: Record<string, Cursor> = { ...onDisk }
+    for (const [file, cur] of Object.entries(cursors)) {
+      const other = merged[file]
+      // Only take the max when both refer to the SAME file incarnation; a rotation (new inode)
+      // legitimately moves the offset backwards and must not be clobbered by a stale high value.
+      merged[file] = other && other.ino === cur.ino && other.offset > cur.offset ? other : cur
+    }
+    writeFileSync(tmp, JSON.stringify(merged, null, 2))
     renameSync(tmp, CURSOR_FILE)
     cursorDirty = false
   } catch (err) {
@@ -272,9 +293,9 @@ function notify(room: string, line: string, p: Parsed, replayed: boolean): void 
  * A partial trailing line (writer mid-append, non-atomic write) is NOT consumed — its bytes
  * stay unread until the newline lands. This is what makes concurrent appends safe.
  */
-function readLines(path: string, from: number, to: number): { lines: string[]; consumed: number } {
+function readLines(path: string, from: number, to: number, skipping = false): { lines: string[]; consumed: number; skipping: boolean } {
   const want = Math.min(to - from, MAX_READ_BYTES)
-  if (want <= 0) return { lines: [], consumed: 0 }
+  if (want <= 0) return { lines: [], consumed: 0, skipping }
   const buf = Buffer.allocUnsafe(want)
   let fd: number | undefined
   let got = 0
@@ -284,17 +305,33 @@ function readLines(path: string, from: number, to: number): { lines: string[]; c
   } finally {
     if (fd !== undefined) try { closeSync(fd) } catch {}
   }
-  if (got <= 0) return { lines: [], consumed: 0 }
+  if (got <= 0) return { lines: [], consumed: 0, skipping }
   const chunk = buf.subarray(0, got)
+
+  // Mid-skip of an over-long line: discard bytes until the line ENDS. Resuming at a fixed byte
+  // offset instead would hand the tail of that line to the parser as if it were a fresh record,
+  // emitting a garbage fragment into the session.
+  if (skipping) {
+    const nl = chunk.indexOf(0x0a)
+    if (nl < 0) return { lines: [], consumed: got, skipping: true } // still inside the monster line
+    const rest = chunk.subarray(nl + 1)
+    const lastNlRest = rest.lastIndexOf(0x0a)
+    if (lastNlRest < 0) return { lines: [], consumed: nl + 1, skipping: false } // line ended, no further whole lines yet
+    const text = rest.subarray(0, lastNlRest + 1).toString('utf8')
+    const lines = text.split('\n')
+    lines.pop()
+    return { lines, consumed: nl + 1 + lastNlRest + 1, skipping: false }
+  }
+
   const lastNl = chunk.lastIndexOf(0x0a)
   if (lastNl < 0) {
     // No newline in the whole window. Either a writer is mid-line, or one line exceeds our
     // ceiling. Only the latter needs intervention — otherwise we would stall forever.
     if (got >= MAX_LINE_BYTES) {
-      dlog(`inbox channel: line > ${MAX_LINE_BYTES}B in ${basename(path)} — skipping ${got}B\n`)
-      return { lines: [], consumed: got }
+      dlog(`inbox channel: line > ${MAX_LINE_BYTES}B in ${basename(path)} — skipping to end of line\n`)
+      return { lines: [], consumed: got, skipping: true }
     }
-    return { lines: [], consumed: 0 }
+    return { lines: [], consumed: 0, skipping: false }
   }
   // Cutting at a newline guarantees the slice is whole UTF-8 — a multibyte character can never
   // straddle the boundary, so no replacement chars from a mid-rune split.
@@ -303,7 +340,7 @@ function readLines(path: string, from: number, to: number): { lines: string[]; c
   // faithful 1:1 image of the consumed bytes. They are skipped at emit time instead.
   const lines = text.split('\n')
   lines.pop() // trailing '' after the final newline — not a record
-  return { lines, consumed: lastNl + 1 }
+  return { lines, consumed: lastNl + 1, skipping: false }
 }
 
 function listInboxFiles(): string[] {
@@ -318,6 +355,8 @@ function listInboxFiles(): string[] {
 }
 
 let booted = false
+// Log a refused symlink once per file, not once per poll tick (1/s forever otherwise).
+const warnedSymlink = new Set<string>()
 
 function scanFile(file: string): number {
   const path = join(INBOX_DIR, file)
@@ -325,6 +364,17 @@ function scanFile(file: string): number {
   let st: ReturnType<typeof statSync>
   try { st = statSync(path) } catch { return 0 }
   if (!st.isFile()) return 0
+  // A symlinked room would let anyone who can write INBOX_DIR point the channel at an arbitrary
+  // file and have its contents read aloud into the session, line by line.
+  try {
+    assertNotSymlink(path, 'read')
+  } catch (err) {
+    if (!warnedSymlink.has(file)) {
+      warnedSymlink.add(file)
+      dlog(`inbox channel: ${err instanceof Error ? err.message : err} — room ${room} ignored\n`)
+    }
+    return 0
+  }
 
   let cur = cursors[file]
 
@@ -367,7 +417,8 @@ function scanFile(file: string): number {
 
   if (st.size <= cur.offset) { cur.size = st.size; return 0 }
 
-  const { lines, consumed } = readLines(path, cur.offset, st.size)
+  const { lines, consumed, skipping } = readLines(path, cur.offset, st.size, cur.skipping)
+  cur.skipping = skipping
   if (!consumed) return 0
 
   // The cursor advances only over lines we actually HANDLED. Advancing over the whole read
@@ -420,17 +471,34 @@ function appendJsonl(path: string, rec: Record<string, unknown>): void {
 /**
  * Peer delivery writes into ANOTHER room's inbox file. Only ever inside INBOX_DIR, only ever a
  * sanitized room name, and only when explicitly enabled.
+ *
+ * assertSafeRoom already blocks traversal in the NAME, but a name-only check is not enough: a
+ * symlink planted at <INBOX_DIR>/<room>.jsonl redirects the write wherever it points, and
+ * appendFileSync follows symlinks. `evil.jsonl -> ~/.ssh/authorized_keys` would turn a reply into
+ * an append to authorized_keys. lstat (which does NOT follow) is the check that actually holds.
  */
 function deliverToPeer(room: string, rec: Record<string, unknown>): string | null {
   if (REPLY_MODE !== 'peer') return null
   const target = join(INBOX_DIR, `${room}${EXT}`)
-  // Belt and braces: even after assertSafeRoom, verify the resolved path stays in INBOX_DIR.
-  const dirReal = realpathSync(INBOX_DIR)
-  if (!join(dirReal, `${room}${EXT}`).startsWith(dirReal + sep)) {
-    throw new Error(`refusing to write outside INBOX_DIR: ${target}`)
-  }
+  assertNotSymlink(target, 'write')
   appendJsonl(target, rec)
   return target
+}
+
+/**
+ * Refuse to read or write through a symlink inside INBOX_DIR.
+ *
+ * Reads matter as much as writes: a room symlinked at ~/.ssh/id_rsa would stream a private key
+ * into the conversation line by line. Since filesystem permissions are this channel's entire
+ * access boundary, anything that can plant a symlink in INBOX_DIR could otherwise redirect the
+ * channel at arbitrary files. A symlinked room file has no legitimate use here.
+ */
+function assertNotSymlink(path: string, mode: 'read' | 'write'): void {
+  let st: ReturnType<typeof lstatSync>
+  try { st = lstatSync(path) } catch { return } // does not exist yet — appendJsonl will create it
+  if (st.isSymbolicLink()) {
+    throw new Error(`refusing to ${mode} through a symlink: ${path}`)
+  }
 }
 
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
@@ -489,6 +557,12 @@ dlog(
   `inbox channel v${VERSION}: watching ${INBOX_DIR}/*${EXT} — poll ${POLL_MS}ms, replay ${REPLAY_RAW}, ` +
   `reply-mode ${REPLY_MODE}, state ${STATE_DIR}\n`,
 )
+if (MAX_READ_BYTES !== RAW_MAX_READ_BYTES) {
+  dlog(
+    `inbox channel: INBOX_MAX_READ_KB (${RAW_MAX_READ_BYTES / 1024}) was below INBOX_MAX_LINE_KB ` +
+    `(${MAX_LINE_BYTES / 1024}) — raised to match, otherwise an over-long line stalls its room forever\n`,
+  )
+}
 
 // Boot scan establishes cursors (and emits the replay window, if any).
 scanAll()
